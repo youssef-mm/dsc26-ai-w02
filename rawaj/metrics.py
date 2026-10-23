@@ -1,49 +1,127 @@
-"""Decision metrics for a mule-risk score.
+"""Metrics module for evaluating threshold policies on fraud detection scores."""
 
-You write this file. Keep the signatures exactly as they are: the grader calls them by name.
-
-Rules for every function:
-- y_true and scores are lists or 1-D arrays. Raise ValueError if the lengths differ, the
-  input is empty, a label is not 0 or 1, or a score is NaN.
-- A case is flagged when score >= threshold.
-- Precision is 0.0 when nothing is flagged; recall is 0.0 when there are no positives.
-"""
 from __future__ import annotations
 
-
-def confusion_at(y_true, scores, threshold: float) -> dict:
-    """Return {"tp": int, "fp": int, "tn": int, "fn": int} at `threshold`."""
-    raise NotImplementedError
-
-
-def precision_recall_at(y_true, scores, threshold: float) -> tuple[float, float]:
-    """Return (precision, recall) at `threshold`."""
-    raise NotImplementedError
+import math
+from typing import Any
+import numpy as np
 
 
-def precision_at_k(y_true, scores, k: int) -> float:
-    """Share of positives among the k highest scores.
+def _validate_inputs(y_true: Any, scores: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Validate y_true and scores inputs according to strict assignment rules."""
+    try:
+        y_arr = np.asarray(y_true)
+        s_arr = np.asarray(scores, dtype=float)
+    except Exception as e:
+        raise ValueError(f"Could not convert inputs to arrays: {e}") from e
 
-    ValueError if k <= 0; if k > n, use n. Rank by score descending; ties keep their
-    original order.
+    if y_arr.ndim != 1 or s_arr.ndim != 1:
+        raise ValueError("Inputs must be 1-dimensional.")
+
+    if len(y_arr) != len(s_arr):
+        raise ValueError(f"Lengths differ: len(y_true)={len(y_arr)}, len(scores)={len(s_arr)}")
+
+    if len(y_arr) == 0:
+        raise ValueError("Input arrays must not be empty.")
+
+    # Check for NaN in scores
+    if np.isnan(s_arr).any():
+        raise ValueError("Scores array contains NaN values.")
+
+    # Check labels: every element must be 0 or 1
+    for val in y_arr:
+        if isinstance(val, (bool, np.bool_)):
+            continue
+        if isinstance(val, (int, np.integer, float, np.floating)):
+            if np.isnan(val) or val not in (0, 1, 0.0, 1.0):
+                raise ValueError(f"Label {val} is not 0 or 1.")
+        else:
+            raise ValueError(f"Label {val} is not 0 or 1.")
+
+    y_int = y_arr.astype(int)
+    return y_int, s_arr
+
+
+def confusion_at(y_true: Any, scores: Any, threshold: float) -> dict[str, int]:
+    """Compute confusion matrix dict at the given score threshold."""
+    y_arr, s_arr = _validate_inputs(y_true, scores)
+    flagged = s_arr >= threshold
+
+    tp = int(np.sum(flagged & (y_arr == 1)))
+    fp = int(np.sum(flagged & (y_arr == 0)))
+    tn = int(np.sum((~flagged) & (y_arr == 0)))
+    fn = int(np.sum((~flagged) & (y_arr == 1)))
+
+    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn}
+
+
+def precision_recall_at(y_true: Any, scores: Any, threshold: float) -> tuple[float, float]:
+    """Compute (precision, recall) at the given threshold."""
+    c = confusion_at(y_true, scores, threshold)
+    tp, fp, fn = c["tp"], c["fp"], c["fn"]
+
+    precision = 0.0 if (tp + fp) == 0 else float(tp / (tp + fp))
+    recall = 0.0 if (tp + fn) == 0 else float(tp / (tp + fn))
+
+    return precision, recall
+
+
+def precision_at_k(y_true: Any, scores: Any, k: int) -> float:
+    """Compute precision among the top-k highest-scoring predictions."""
+    if not isinstance(k, (int, np.integer)) or isinstance(k, bool) or k <= 0:
+        raise ValueError("k must be a positive integer > 0.")
+
+    y_arr, s_arr = _validate_inputs(y_true, scores)
+    n = len(y_arr)
+    effective_k = min(int(k), n)
+
+    # Rank by score descending; stable sort preserves original index order on ties
+    indices = sorted(range(n), key=lambda i: s_arr[i], reverse=True)
+    top_k_indices = indices[:effective_k]
+
+    positives = sum(1 for i in top_k_indices if y_arr[i] == 1)
+    return float(positives / effective_k)
+
+
+def expected_cost(y_true: Any, scores: Any, threshold: float, *, cost_fp: float, cost_fn: float) -> float:
+    """Compute expected business cost of false positives and false negatives."""
+    c = confusion_at(y_true, scores, threshold)
+    return float(c["fp"] * cost_fp + c["fn"] * cost_fn)
+
+
+def best_threshold(y_true: Any, scores: Any, *, cost_fp: float, cost_fn: float) -> float:
+    """Find the threshold that minimizes expected cost.
+    
+    Candidates are every distinct score plus math.inf.
+    On tie, returns the highest threshold (fewer flags for the same cost).
     """
-    raise NotImplementedError
+    y_arr, s_arr = _validate_inputs(y_true, scores)
+    unique_scores = sorted(list(set(s_arr.tolist())))
+    candidates = unique_scores + [math.inf]
+
+    def sort_key(t: float) -> tuple[float, float]:
+        cost = expected_cost(y_arr, s_arr, t, cost_fp=cost_fp, cost_fn=cost_fn)
+        neg_t = -float("inf") if math.isinf(t) else -t
+        return (cost, neg_t)
+
+    return min(candidates, key=sort_key)
 
 
-def expected_cost(y_true, scores, threshold: float, *, cost_fp: float, cost_fn: float) -> float:
-    """fp * cost_fp + fn * cost_fn at `threshold`."""
-    raise NotImplementedError
-
-
-def best_threshold(y_true, scores, *, cost_fp: float, cost_fn: float) -> float:
-    """Threshold with the lowest expected cost.
-
-    Candidates are every distinct score plus math.inf ("flag nothing"). On a tie in cost,
-    return the highest threshold (fewer flags for the same cost).
+def threshold_for_precision(y_true: Any, scores: Any, min_precision: float) -> float | None:
+    """Find the lowest threshold among distinct scores whose precision is >= min_precision.
+    
+    Returns None if no threshold reaches min_precision.
     """
-    raise NotImplementedError
+    y_arr, s_arr = _validate_inputs(y_true, scores)
+    unique_scores = sorted(list(set(s_arr.tolist())))
 
+    valid_thresholds = []
+    for t in unique_scores:
+        prec, _ = precision_recall_at(y_arr, s_arr, t)
+        if prec >= min_precision or math.isclose(prec, min_precision, rel_tol=1e-9, abs_tol=1e-9):
+            valid_thresholds.append(t)
 
-def threshold_for_precision(y_true, scores, min_precision: float) -> float | None:
-    """Lowest distinct score whose precision is >= min_precision, or None if none reaches it."""
-    raise NotImplementedError
+    if not valid_thresholds:
+        return None
+
+    return min(valid_thresholds)
